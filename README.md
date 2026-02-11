@@ -23,13 +23,14 @@
 
 依存ライブラリ:
 ```bash
-pip install pytesseract openai openpyxl
+pip install pytesseract openai openpyxl cryptography
 ```
 
-環境変数:
-```bash
-export OPENAI_API_KEY="your_api_key"
-```
+APIキー管理:
+- 初回起動時に API キー入力ダイアログを表示
+- API キーは `config/api_key.enc` に暗号化保存
+- 暗号鍵は `config/key.bin` に保存（APIキー本体とは別ファイル）
+- GUI の「設定 / APIキー」から再設定・削除可能
 
 ## 使い方（GUI）
 ```bash

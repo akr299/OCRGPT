@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -10,6 +9,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 import pytesseract
 from openai import OpenAI
+from openai import AuthenticationError, RateLimitError
 from openpyxl import load_workbook
 
 SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
@@ -112,16 +112,18 @@ def collect_image_files(input_folder: Path) -> List[Path]:
 
 
 class ReceiptProcessor:
-    def __init__(self, model: str = "gpt-4.1-mini", ocr_lang: str = "jpn+eng", tesseract_cmd: str | None = None):
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "gpt-4.1-mini",
+        ocr_lang: str = "jpn+eng",
+        tesseract_cmd: str | None = None,
+    ):
+        self.api_key = api_key
         self.model = model
         self.ocr_lang = ocr_lang
         if tesseract_cmd:
             pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
-
-    @staticmethod
-    def ensure_openai_api_key() -> None:
-        if not os.getenv("OPENAI_API_KEY"):
-            raise RuntimeError("OPENAI_API_KEY が設定されていません。")
 
     def _ocr_image(self, image_path: Path) -> str:
         text = pytesseract.image_to_string(str(image_path), lang=self.ocr_lang)
@@ -166,8 +168,10 @@ class ReceiptProcessor:
         if not image_files:
             raise FileNotFoundError("対応画像ファイルがありません。")
 
-        self.ensure_openai_api_key()
-        client = OpenAI()
+        if not self.api_key.strip():
+            raise RuntimeError("OpenAI APIキーが設定されていません。設定から再登録してください。")
+
+        client = OpenAI(api_key=self.api_key)
 
         records: List[Tuple[str, ReceiptRecord]] = []
         failures: List[ProcessFailure] = []
@@ -179,6 +183,10 @@ class ReceiptProcessor:
                 if not record.note:
                     record.note = f"OCR元: {image_path.name}"
                 records.append((image_path.name, record))
+            except AuthenticationError:
+                raise RuntimeError("OpenAI APIキー認証に失敗しました。設定からAPIキーを再登録してください。")
+            except RateLimitError:
+                raise RuntimeError("OpenAIの利用上限に達しました。課金状況を確認し、必要ならAPIキーを再設定してください。")
             except Exception as exc:
                 failures.append(ProcessFailure(file_name=image_path.name, reason=str(exc)))
 
