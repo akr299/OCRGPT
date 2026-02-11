@@ -14,10 +14,12 @@ from typing import Dict, List
 
 from api_key_manager import ApiKeyManager
 from receipt_core import (
+    EXCEL_COLUMNS,
     JAPANESE_ACCOUNTING_CATEGORIES,
     ReceiptProcessor,
     ReceiptRecord,
     append_records_to_excel,
+    calculate_expense_amount,
     normalize_date_value,
 )
 
@@ -45,13 +47,19 @@ class ReceiptApp:
         self.status_var = tk.StringVar(value="準備完了")
 
         self.form_vars: Dict[str, tk.StringVar] = {
-            "date": tk.StringVar(),
-            "store": tk.StringVar(),
-            "total": tk.StringVar(),
-            "category": tk.StringVar(),
-            "payment": tk.StringVar(),
-            "note": tk.StringVar(),
+            "日付": tk.StringVar(),
+            "勘定科目": tk.StringVar(),
+            "内容": tk.StringVar(),
+            "支払先": tk.StringVar(),
+            "支払方法": tk.StringVar(),
+            "金額(税込)": tk.StringVar(),
+            "税区分": tk.StringVar(),
+            "事業利用割合(%)": tk.StringVar(),
+            "経費計上額": tk.StringVar(),
+            "備考": tk.StringVar(),
+            "is_error": tk.StringVar(),
             "error_reason": tk.StringVar(),
+            "その他項目": tk.StringVar(),
         }
 
         self._build_ui()
@@ -117,28 +125,34 @@ class ReceiptApp:
         edit_frame = ttk.LabelFrame(self.root, text="選択レコードの手動修正")
         edit_frame.pack(fill="x", padx=12, pady=8)
 
-        self._make_form_entry(edit_frame, "日付", "date", 0, hint="和暦/西暦どちらでも可")
-        self._make_form_entry(edit_frame, "店名", "store", 1)
-        self._make_form_entry(edit_frame, "金額", "total", 2)
+        self._make_form_entry(edit_frame, "日付", "日付", 0, hint="和暦/西暦どちらでも可")
+        self._make_form_entry(edit_frame, "支払先", "支払先", 1)
+        self._make_form_entry(edit_frame, "金額(税込)", "金額(税込)", 2)
 
-        ttk.Label(edit_frame, text="カテゴリ").grid(row=1, column=0, sticky="w", padx=8, pady=4)
+        ttk.Label(edit_frame, text="勘定科目").grid(row=1, column=0, sticky="w", padx=8, pady=4)
         self.category_combo = ttk.Combobox(
             edit_frame,
-            textvariable=self.form_vars["category"],
+            textvariable=self.form_vars["勘定科目"],
             values=JAPANESE_ACCOUNTING_CATEGORIES,
             state="normal",
             width=32,
         )
         self.category_combo.grid(row=1, column=1, sticky="w", padx=8, pady=4)
 
-        self._make_form_entry(edit_frame, "支払", "payment", 1, col_offset=2)
-        self._make_form_entry(edit_frame, "メモ", "note", 2, col_offset=2)
-        self._make_form_entry(edit_frame, "エラー理由", "error_reason", 0, col_offset=2)
+        self._make_form_entry(edit_frame, "支払方法", "支払方法", 0, col_offset=2)
+        self._make_form_entry(edit_frame, "内容", "内容", 1, col_offset=2)
+        self._make_form_entry(edit_frame, "税区分", "税区分", 2, col_offset=2)
+        self._make_form_entry(edit_frame, "事業利用割合(%)", "事業利用割合(%)", 0, col_offset=4)
+        self._make_form_entry(edit_frame, "経費計上額", "経費計上額", 1, col_offset=4)
+        self._make_form_entry(edit_frame, "備考", "備考", 2, col_offset=4)
+        self._make_form_entry(edit_frame, "その他項目", "その他項目", 0, col_offset=6)
+        self._make_form_entry(edit_frame, "is_error(0/1)", "is_error", 1, col_offset=6)
+        self._make_form_entry(edit_frame, "エラー理由", "error_reason", 2, col_offset=6)
 
         ttk.Button(edit_frame, text="選択行へ反映", command=self._apply_form_to_selected).grid(row=3, column=5, padx=8, pady=4, sticky="e")
 
         ttk.Label(edit_frame, text="※ 空白入力でも保存可能。必須チェックは行いません。").grid(
-            row=3, column=0, columnspan=4, sticky="w", padx=8, pady=4
+            row=3, column=0, columnspan=8, sticky="w", padx=8, pady=4
         )
 
     def _make_form_entry(self, parent: ttk.LabelFrame, label: str, key: str, row: int, col_offset: int = 0, hint: str = "") -> None:
@@ -291,7 +305,7 @@ class ReceiptApp:
             self.root.after(200, self._poll_worker)
 
     def _derive_columns(self) -> List[str]:
-        base = ["file_name", "date", "store", "total", "category", "payment", "note", "is_error", "error_reason", "source_image_link"]
+        base = ["file_name", *EXCEL_COLUMNS, "source_image_link"]
         extras = sorted({k for r in self.records for k in r.fields.keys() if k not in base})
         return base + extras
 
@@ -303,7 +317,7 @@ class ReceiptApp:
 
         for col in self.tree_columns:
             self.tree.heading(col, text=col)
-            width = 140 if col not in {"note", "error_reason", "source_image_link"} else 260
+            width = 140 if col not in {"備考", "その他項目", "error_reason", "source_image_link"} else 260
             self.tree.column(col, width=width, anchor="w")
 
         for index, record in enumerate(self.records):
@@ -334,6 +348,8 @@ class ReceiptApp:
         for key in self.form_vars:
             if key == "error_reason":
                 self.form_vars[key].set(rec.error_reason)
+            elif key == "is_error":
+                self.form_vars[key].set("1" if rec.is_error else "0")
             else:
                 self.form_vars[key].set(str(rec.get(key, "")))
 
@@ -342,19 +358,25 @@ class ReceiptApp:
             return
 
         rec = self.records[int(self.selected_item_id)]
-        rec.set("date", self.form_vars["date"].get().strip())
-        rec.set("store", self.form_vars["store"].get().strip())
-        rec.set("total", self.form_vars["total"].get().strip())
-        rec.set("category", self.form_vars["category"].get().strip())
-        rec.set("payment", self.form_vars["payment"].get().strip())
-        rec.set("note", self.form_vars["note"].get().strip())
-        rec.error_reason = self.form_vars["error_reason"].get().strip()
-        rec.is_error = bool(rec.error_reason)
+        for key in EXCEL_COLUMNS:
+            if key in {"is_error", "error_reason"}:
+                continue
+            rec.set(key, self.form_vars[key].get().strip())
 
-        normalized_date, date_error = normalize_date_value(rec.get("date", ""))
-        rec.set("date", normalized_date)
-        if date_error and rec.get("date", ""):
+        rec.error_reason = self.form_vars["error_reason"].get().strip()
+        is_error_text = self.form_vars["is_error"].get().strip().lower()
+        rec.is_error = is_error_text in {"1", "true", "t", "yes", "y"} or bool(rec.error_reason)
+
+        normalized_date, date_error = normalize_date_value(rec.get("日付", ""))
+        rec.set("日付", normalized_date)
+        if date_error:
             rec.mark_error(date_error)
+
+        rec.set(
+            "経費計上額",
+            self.form_vars["経費計上額"].get().strip()
+            or calculate_expense_amount(rec.get("金額(税込)", ""), rec.get("事業利用割合(%)", "")),
+        )
 
         self._render_table()
         self.tree.selection_set(self.selected_item_id)
@@ -370,7 +392,7 @@ class ReceiptApp:
             return
 
         key = self.tree_columns[col_idx]
-        if key in {"file_name", "is_error", "source_image_link"}:
+        if key in {"file_name", "source_image_link"}:
             return
 
         bbox = self.tree.bbox(item_id, column_id)
@@ -393,14 +415,22 @@ class ReceiptApp:
 
             if key == "error_reason":
                 rec.error_reason = new_value
-                rec.is_error = bool(new_value)
-            elif key == "date":
+                rec.is_error = bool(new_value) or rec.is_error
+            elif key == "is_error":
+                rec.is_error = new_value.lower() in {"1", "true", "t", "yes", "y"}
+            elif key == "日付":
                 normalized, date_error = normalize_date_value(new_value)
-                rec.set("date", normalized)
-                if date_error and normalized:
+                rec.set("日付", normalized)
+                if date_error:
                     rec.mark_error(date_error)
             else:
                 rec.set(key, new_value)
+
+            if key in {"金額(税込)", "事業利用割合(%)"} and not rec.get("経費計上額", ""):
+                rec.set(
+                    "経費計上額",
+                    calculate_expense_amount(rec.get("金額(税込)", ""), rec.get("事業利用割合(%)", "")),
+                )
 
             self._render_table()
             self.tree.selection_set(item_id)
