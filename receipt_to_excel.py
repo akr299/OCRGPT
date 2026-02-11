@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import os
 import platform
 import subprocess
 import threading
 import tkinter as tk
 import webbrowser
+from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, Queue
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -20,8 +22,41 @@ from receipt_core import (
     ReceiptRecord,
     append_records_to_excel,
     calculate_expense_amount,
+    infer_tax_category,
     normalize_date_value,
 )
+
+
+@dataclass
+class AppPathsConfig:
+    input_folder: str = ""
+    excel_path: str = ""
+
+
+class AppConfigStore:
+    """入力/出力パスをOS標準の設定ディレクトリへ保存する。"""
+
+    def __init__(self, config_dir: Path | None = None):
+        self.api_key_manager = ApiKeyManager(config_dir=config_dir)
+        self.config_dir = self.api_key_manager.config_dir
+        self.config_file = self.config_dir / "app_paths.json"
+
+    def load(self) -> AppPathsConfig:
+        if not self.config_file.exists():
+            return AppPathsConfig()
+        try:
+            payload = json.loads(self.config_file.read_text(encoding="utf-8"))
+            return AppPathsConfig(
+                input_folder=str(payload.get("input_folder", "")),
+                excel_path=str(payload.get("excel_path", "")),
+            )
+        except Exception:
+            return AppPathsConfig()
+
+    def save(self, config: AppPathsConfig) -> None:
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        payload = {"input_folder": config.input_folder, "excel_path": config.excel_path}
+        self.config_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 class ReceiptApp:
@@ -35,11 +70,13 @@ class ReceiptApp:
         self.selected_item_id: str | None = None
         self.result_queue: Queue = Queue()
 
-        self.api_key_manager = ApiKeyManager()
+        self.config_store = AppConfigStore()
+        self.api_key_manager = self.config_store.api_key_manager
         self.api_key: str | None = None
 
-        self.input_folder_var = tk.StringVar()
-        self.excel_path_var = tk.StringVar()
+        paths = self.config_store.load()
+        self.input_folder_var = tk.StringVar(value=paths.input_folder)
+        self.excel_path_var = tk.StringVar(value=paths.excel_path)
         self.model_var = tk.StringVar(value="gpt-4.1-mini")
         self.ocr_lang_var = tk.StringVar(value="jpn+eng")
         self.sheet_name_var = tk.StringVar()
@@ -59,12 +96,12 @@ class ReceiptApp:
             "備考": tk.StringVar(),
             "is_error": tk.StringVar(),
             "error_reason": tk.StringVar(),
-            "その他項目": tk.StringVar(),
         }
 
         self._build_ui()
         self._load_saved_api_key_or_prompt()
         self.root.after(200, self._poll_worker)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self) -> None:
         config_frame = ttk.LabelFrame(self.root, text="設定")
@@ -109,7 +146,7 @@ class ReceiptApp:
         table_frame.pack(fill="both", expand=True, padx=12, pady=8)
 
         self.tree = ttk.Treeview(table_frame, show="headings", height=14)
-        self.tree.tag_configure("error", background="#ffd9d9")
+        self.tree.tag_configure("error", background="#ffb3b3")
 
         y_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
         x_scroll = ttk.Scrollbar(table_frame, orient="horizontal", command=self.tree.xview)
@@ -127,41 +164,32 @@ class ReceiptApp:
 
         self._make_form_entry(edit_frame, "日付", "日付", 0, hint="和暦/西暦どちらでも可")
         self._make_form_entry(edit_frame, "支払先", "支払先", 1)
-        self._make_form_entry(edit_frame, "金額(税込)", "金額(税込)", 2)
+        self._make_form_entry(edit_frame, "勘定科目", "勘定科目", 2, hint="例: " + " / ".join(JAPANESE_ACCOUNTING_CATEGORIES[:5]))
 
-        ttk.Label(edit_frame, text="勘定科目").grid(row=1, column=0, sticky="w", padx=8, pady=4)
-        self.category_combo = ttk.Combobox(
-            edit_frame,
-            textvariable=self.form_vars["勘定科目"],
-            values=JAPANESE_ACCOUNTING_CATEGORIES,
-            state="normal",
-            width=32,
-        )
-        self.category_combo.grid(row=1, column=1, sticky="w", padx=8, pady=4)
+        self._make_form_entry(edit_frame, "内容", "内容", 0, col_offset=3)
+        self._make_form_entry(edit_frame, "支払方法", "支払方法", 1, col_offset=3)
+        self._make_form_entry(edit_frame, "金額(税込)", "金額(税込)", 2, col_offset=3)
 
-        self._make_form_entry(edit_frame, "支払方法", "支払方法", 0, col_offset=2)
-        self._make_form_entry(edit_frame, "内容", "内容", 1, col_offset=2)
-        self._make_form_entry(edit_frame, "税区分", "税区分", 2, col_offset=2)
-        self._make_form_entry(edit_frame, "事業利用割合(%)", "事業利用割合(%)", 0, col_offset=4)
-        self._make_form_entry(edit_frame, "経費計上額", "経費計上額", 1, col_offset=4)
-        self._make_form_entry(edit_frame, "備考", "備考", 2, col_offset=4)
-        self._make_form_entry(edit_frame, "その他項目", "その他項目", 0, col_offset=6)
-        self._make_form_entry(edit_frame, "is_error(0/1)", "is_error", 1, col_offset=6)
-        self._make_form_entry(edit_frame, "エラー理由", "error_reason", 2, col_offset=6)
+        self._make_form_entry(edit_frame, "税区分", "税区分", 0, col_offset=6, hint="8% / 10%")
+        self._make_form_entry(edit_frame, "事業利用割合(%)", "事業利用割合(%)", 1, col_offset=6)
+        self._make_form_entry(edit_frame, "経費計上額", "経費計上額", 2, col_offset=6)
+        self._make_form_entry(edit_frame, "備考", "備考", 0, col_offset=9)
+        self._make_form_entry(edit_frame, "is_error", "is_error", 1, col_offset=9)
+        self._make_form_entry(edit_frame, "エラー理由", "error_reason", 2, col_offset=9)
 
-        ttk.Button(edit_frame, text="選択行へ反映", command=self._apply_form_to_selected).grid(row=3, column=5, padx=8, pady=4, sticky="e")
+        ttk.Button(edit_frame, text="選択行へ反映", command=self._apply_form_to_selected).grid(row=3, column=11, padx=8, pady=4, sticky="e")
 
-        ttk.Label(edit_frame, text="※ 空白入力でも保存可能。必須チェックは行いません。").grid(
-            row=3, column=0, columnspan=8, sticky="w", padx=8, pady=4
+        ttk.Label(edit_frame, text="※ 空白入力でも保存可能。人が判断して修正する前提です。", foreground="#444").grid(
+            row=3, column=0, columnspan=12, sticky="w", padx=8, pady=4
         )
 
     def _make_form_entry(self, parent: ttk.LabelFrame, label: str, key: str, row: int, col_offset: int = 0, hint: str = "") -> None:
-        c = col_offset * 2
+        c = col_offset
         ttk.Label(parent, text=label).grid(row=row, column=c, sticky="w", padx=8, pady=4)
-        entry = ttk.Entry(parent, textvariable=self.form_vars[key], width=32)
+        entry = ttk.Entry(parent, textvariable=self.form_vars[key], width=22)
         entry.grid(row=row, column=c + 1, sticky="w", padx=8, pady=4)
         if hint:
-            ttk.Label(parent, text=hint, foreground="#666").grid(row=row, column=c + 2, sticky="w", padx=8)
+            ttk.Label(parent, text=hint, foreground="#666").grid(row=row, column=c + 2, sticky="w", padx=2)
 
     def _update_api_key_status(self) -> None:
         self.api_key_status_var.set("API Key: 設定済み" if self.api_key else "API Key: 未設定")
@@ -188,7 +216,7 @@ class ReceiptApp:
                     continue
                 return False
 
-            self.api_key_manager.save_key(value)
+            self.api_key_manager.save_api_key(value)
             self.api_key = value
             self._update_api_key_status()
             messagebox.showinfo("保存完了", "APIキーを保存しました。")
@@ -216,13 +244,13 @@ class ReceiptApp:
             if not key:
                 messagebox.showwarning("入力不足", "APIキーを入力してください。", parent=settings)
                 return
-            self.api_key_manager.save_key(key)
+            self.api_key_manager.save_api_key(key)
             self.api_key = key
             self._update_api_key_status()
             messagebox.showinfo("保存完了", "APIキーを保存しました。", parent=settings)
 
         def delete_key() -> None:
-            self.api_key_manager.delete_key()
+            self.api_key_manager.delete_api_key()
             self.api_key = None
             self._update_api_key_status()
             messagebox.showinfo("削除完了", "保存済みAPIキーを削除しました。", parent=settings)
@@ -317,7 +345,7 @@ class ReceiptApp:
 
         for col in self.tree_columns:
             self.tree.heading(col, text=col)
-            width = 140 if col not in {"備考", "その他項目", "error_reason", "source_image_link"} else 260
+            width = 140 if col not in {"備考", "error_reason", "source_image_link"} else 260
             self.tree.column(col, width=width, anchor="w")
 
         for index, record in enumerate(self.records):
@@ -353,6 +381,36 @@ class ReceiptApp:
             else:
                 self.form_vars[key].set(str(rec.get(key, "")))
 
+    def _apply_record_rules(self, rec: ReceiptRecord) -> None:
+        normalized_date, date_error = normalize_date_value(rec.get("日付", ""))
+        rec.set("日付", normalized_date)
+
+        tax_value, tax_error = infer_tax_category(rec.get("税区分", ""))
+        rec.set("税区分", tax_value)
+
+        if not rec.get("経費計上額", ""):
+            rec.set("経費計上額", calculate_expense_amount(rec.get("金額(税込)", ""), rec.get("事業利用割合(%)", "")))
+
+        reasons = []
+        if not rec.get("支払先", ""):
+            reasons.append("store_not_found")
+        if not rec.get("金額(税込)", ""):
+            reasons.append("amount_not_found")
+        if date_error:
+            reasons.append(date_error)
+        if tax_error:
+            reasons.append(tax_error)
+
+        manual_reasons = [item for item in self.form_vars["error_reason"].get().split("|") if item.strip()] if self.selected_item_id else []
+        merged = []
+        for reason in [*reasons, *manual_reasons]:
+            if reason and reason not in merged:
+                merged.append(reason)
+
+        rec.error_reason = "|".join(merged)
+        manual_is_error = self.form_vars["is_error"].get().strip().lower() in {"1", "true", "t", "yes", "y"}
+        rec.is_error = manual_is_error or bool(rec.error_reason)
+
     def _apply_form_to_selected(self) -> None:
         if self.selected_item_id is None:
             return
@@ -363,20 +421,7 @@ class ReceiptApp:
                 continue
             rec.set(key, self.form_vars[key].get().strip())
 
-        rec.error_reason = self.form_vars["error_reason"].get().strip()
-        is_error_text = self.form_vars["is_error"].get().strip().lower()
-        rec.is_error = is_error_text in {"1", "true", "t", "yes", "y"} or bool(rec.error_reason)
-
-        normalized_date, date_error = normalize_date_value(rec.get("日付", ""))
-        rec.set("日付", normalized_date)
-        if date_error:
-            rec.mark_error(date_error)
-
-        rec.set(
-            "経費計上額",
-            self.form_vars["経費計上額"].get().strip()
-            or calculate_expense_amount(rec.get("金額(税込)", ""), rec.get("事業利用割合(%)", "")),
-        )
+        self._apply_record_rules(rec)
 
         self._render_table()
         self.tree.selection_set(self.selected_item_id)
@@ -415,22 +460,15 @@ class ReceiptApp:
 
             if key == "error_reason":
                 rec.error_reason = new_value
-                rec.is_error = bool(new_value) or rec.is_error
             elif key == "is_error":
                 rec.is_error = new_value.lower() in {"1", "true", "t", "yes", "y"}
-            elif key == "日付":
-                normalized, date_error = normalize_date_value(new_value)
-                rec.set("日付", normalized)
-                if date_error:
-                    rec.mark_error(date_error)
             else:
                 rec.set(key, new_value)
 
-            if key in {"金額(税込)", "事業利用割合(%)"} and not rec.get("経費計上額", ""):
-                rec.set(
-                    "経費計上額",
-                    calculate_expense_amount(rec.get("金額(税込)", ""), rec.get("事業利用割合(%)", "")),
-                )
+            self.selected_item_id = item_id
+            self.form_vars["error_reason"].set(rec.error_reason)
+            self.form_vars["is_error"].set("1" if rec.is_error else "0")
+            self._apply_record_rules(rec)
 
             self._render_table()
             self.tree.selection_set(item_id)
@@ -477,6 +515,15 @@ class ReceiptApp:
             self.status_var.set(f"Excel保存完了: {appended}件")
         except Exception as exc:
             messagebox.showerror("保存エラー", str(exc))
+
+    def _on_close(self) -> None:
+        self.config_store.save(
+            AppPathsConfig(
+                input_folder=self.input_folder_var.get().strip(),
+                excel_path=self.excel_path_var.get().strip(),
+            )
+        )
+        self.root.destroy()
 
 
 def main() -> None:
