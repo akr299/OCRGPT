@@ -1,303 +1,245 @@
 #!/usr/bin/env python3
-"""
-Batch process receipt images:
-1) OCR each image with pytesseract
-2) Ask OpenAI to extract structured fields
-3) Validate JSON schema and types
-4) Append results into an existing Excel template (expense.xlsx)
-
-Usage:
-    python receipt_to_excel.py --input-folder ./receipts --excel-template ./expense.xlsx
-
-Environment:
-    export OPENAI_API_KEY="..."
-
-Notes:
-- Tesseract engine must be installed on your machine.
-- If needed, set --tesseract-cmd to the tesseract executable path.
-"""
-
 from __future__ import annotations
 
-import argparse
-import json
-import re
-from dataclasses import dataclass
-from datetime import datetime
+import threading
+import tkinter as tk
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from queue import Empty, Queue
+from tkinter import filedialog, messagebox, ttk
+from typing import List, Tuple
 
-import pandas as pd
-import pytesseract
-from openai import OpenAI
-from openpyxl import load_workbook
-
-# Expected output schema from the model
-REQUIRED_SCHEMA = {
-    "store": str,
-    "date": str,      # YYYY-MM-DD
-    "total": int,
-    "tax8": int,
-    "tax10": int,
-    "payment": str,
-    "category": str,
-}
-
-SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+from receipt_core import (
+    JAPANESE_ACCOUNTING_CATEGORIES,
+    ReceiptProcessor,
+    ReceiptRecord,
+    append_records_to_excel,
+)
 
 
-@dataclass
-class ProcessResult:
-    """Processing result for a single image file."""
+class ReceiptApp:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("OCRGPT 領収書OCR")
+        self.root.geometry("1050x650")
 
-    file_name: str
-    ok: bool
-    data: Dict[str, Any] | None = None
-    error: str | None = None
+        self.records: List[Tuple[str, ReceiptRecord]] = []
+        self.result_queue: Queue = Queue()
 
+        self.input_folder_var = tk.StringVar()
+        self.excel_path_var = tk.StringVar()
+        self.model_var = tk.StringVar(value="gpt-4.1-mini")
+        self.ocr_lang_var = tk.StringVar(value="jpn+eng")
+        self.sheet_name_var = tk.StringVar()
 
-def extract_json_from_text(text: str) -> Dict[str, Any]:
-    """
-    Extract JSON object from model output.
+        self.selected_item_id: str | None = None
+        self._build_ui()
+        self.root.after(200, self._poll_worker)
 
-    Handles either pure JSON response or JSON inside markdown code fences.
-    """
-    cleaned = text.strip()
+    def _build_ui(self) -> None:
+        config_frame = ttk.LabelFrame(self.root, text="設定")
+        config_frame.pack(fill="x", padx=12, pady=8)
 
-    # Remove markdown code fences, e.g. ```json ... ```
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\s*```$", "", cleaned)
+        ttk.Label(config_frame, text="画像フォルダ").grid(row=0, column=0, sticky="w", padx=4, pady=4)
+        ttk.Entry(config_frame, textvariable=self.input_folder_var, width=70).grid(row=0, column=1, sticky="ew", padx=4, pady=4)
+        ttk.Button(config_frame, text="参照", command=self._pick_input_folder).grid(row=0, column=2, padx=4, pady=4)
 
-    # Try direct parse first
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        pass
+        ttk.Label(config_frame, text="保存先Excel").grid(row=1, column=0, sticky="w", padx=4, pady=4)
+        ttk.Entry(config_frame, textvariable=self.excel_path_var, width=70).grid(row=1, column=1, sticky="ew", padx=4, pady=4)
+        ttk.Button(config_frame, text="参照", command=self._pick_excel_path).grid(row=1, column=2, padx=4, pady=4)
 
-    # Fallback: find first JSON object in text
-    match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
-    if not match:
-        raise ValueError("Model response did not contain a JSON object.")
+        ttk.Label(config_frame, text="OpenAIモデル").grid(row=2, column=0, sticky="w", padx=4, pady=4)
+        ttk.Entry(config_frame, textvariable=self.model_var, width=30).grid(row=2, column=1, sticky="w", padx=4, pady=4)
 
-    return json.loads(match.group(0))
+        ttk.Label(config_frame, text="OCR言語").grid(row=2, column=1, sticky="e", padx=4, pady=4)
+        ttk.Entry(config_frame, textvariable=self.ocr_lang_var, width=12).grid(row=2, column=2, sticky="w", padx=4, pady=4)
 
+        ttk.Label(config_frame, text="Sheet名(任意)").grid(row=3, column=0, sticky="w", padx=4, pady=4)
+        ttk.Entry(config_frame, textvariable=self.sheet_name_var, width=30).grid(row=3, column=1, sticky="w", padx=4, pady=4)
 
-def validate_record(record: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Validate required keys and expected types.
+        config_frame.columnconfigure(1, weight=1)
 
-    Also validates date format YYYY-MM-DD and normalizes integer-like strings.
-    Returns normalized record if valid.
-    """
-    missing = [k for k in REQUIRED_SCHEMA if k not in record]
-    if missing:
-        raise ValueError(f"Missing keys: {missing}")
+        action_frame = ttk.Frame(self.root)
+        action_frame.pack(fill="x", padx=12, pady=6)
 
-    normalized: Dict[str, Any] = {}
+        self.process_button = ttk.Button(action_frame, text="OCR + OpenAI実行", command=self._start_processing)
+        self.process_button.pack(side="left", padx=4)
 
-    for key, expected_type in REQUIRED_SCHEMA.items():
-        value = record[key]
+        self.save_button = ttk.Button(action_frame, text="Save to Excel", command=self._save_to_excel, state="disabled")
+        self.save_button.pack(side="left", padx=4)
 
-        if expected_type is int:
-            # Accept numeric strings (e.g., "14619", "14,619", "¥14,619") and normalize to int
-            if isinstance(value, int):
-                normalized[key] = value
-            elif isinstance(value, str):
-                digits = re.sub(r"[^0-9-]", "", value)
-                if digits == "" or digits == "-":
-                    raise ValueError(f"Key '{key}' is not a valid integer string: {value!r}")
-                normalized[key] = int(digits)
-            else:
-                raise ValueError(f"Key '{key}' expected int, got {type(value).__name__}")
-        elif expected_type is str:
-            if not isinstance(value, str):
-                raise ValueError(f"Key '{key}' expected str, got {type(value).__name__}")
-            normalized[key] = value.strip()
+        self.status_var = tk.StringVar(value="準備完了")
+        ttk.Label(action_frame, textvariable=self.status_var).pack(side="left", padx=20)
+
+        table_frame = ttk.LabelFrame(self.root, text="抽出結果（カテゴリは下で修正できます）")
+        table_frame.pack(fill="both", expand=True, padx=12, pady=8)
+
+        columns = ("file", "date", "store", "total", "category", "payment", "note")
+        self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=16)
+        for col, label, width in [
+            ("file", "画像", 180),
+            ("date", "日付", 100),
+            ("store", "店舗", 220),
+            ("total", "金額", 90),
+            ("category", "カテゴリ", 130),
+            ("payment", "支払", 110),
+            ("note", "メモ", 220),
+        ]:
+            self.tree.heading(col, text=label)
+            self.tree.column(col, width=width, anchor="w")
+
+        y_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=y_scroll.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        y_scroll.pack(side="right", fill="y")
+
+        self.tree.bind("<<TreeviewSelect>>", self._on_row_selected)
+
+        edit_frame = ttk.LabelFrame(self.root, text="カテゴリ修正")
+        edit_frame.pack(fill="x", padx=12, pady=8)
+
+        ttk.Label(edit_frame, text="選択行のカテゴリ").pack(side="left", padx=8)
+        self.category_var = tk.StringVar()
+        self.category_combo = ttk.Combobox(
+            edit_frame,
+            textvariable=self.category_var,
+            values=JAPANESE_ACCOUNTING_CATEGORIES,
+            state="readonly",
+            width=24,
+        )
+        self.category_combo.pack(side="left", padx=8)
+        self.category_combo.bind("<<ComboboxSelected>>", self._update_selected_category)
+
+    def _pick_input_folder(self) -> None:
+        folder = filedialog.askdirectory(title="領収書画像フォルダを選択")
+        if folder:
+            self.input_folder_var.set(folder)
+
+    def _pick_excel_path(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Excelファイルを選択",
+            filetypes=[("Excel file", "*.xlsx *.xlsm")],
+        )
+        if path:
+            self.excel_path_var.set(path)
+
+    def _set_processing_state(self, running: bool) -> None:
+        if running:
+            self.process_button.config(state="disabled")
+            self.save_button.config(state="disabled")
         else:
-            raise ValueError(f"Unsupported schema type for key '{key}'")
+            self.process_button.config(state="normal")
+            self.save_button.config(state="normal" if self.records else "disabled")
 
-    # Validate date format strictly
-    try:
-        datetime.strptime(normalized["date"], "%Y-%m-%d")
-    except ValueError as exc:
-        raise ValueError(f"Invalid date format for 'date': {normalized['date']!r}; expected YYYY-MM-DD") from exc
+    def _start_processing(self) -> None:
+        input_folder = self.input_folder_var.get().strip()
+        if not input_folder:
+            messagebox.showerror("入力不足", "画像フォルダを指定してください。")
+            return
 
-    return normalized
+        self._set_processing_state(True)
+        self.status_var.set("OCR + OpenAI 処理中...")
+        self.tree.delete(*self.tree.get_children())
+        self.records.clear()
 
+        thread = threading.Thread(target=self._worker_process, daemon=True)
+        thread.start()
 
-def ocr_image(image_path: Path, lang: str = "jpn+eng") -> str:
-    """Run OCR on one image file and return extracted text."""
-    return pytesseract.image_to_string(str(image_path), lang=lang)
-
-
-def call_openai_extract(client: OpenAI, model: str, ocr_text: str) -> Dict[str, Any]:
-    """
-    Ask OpenAI to extract receipt fields as strict JSON object.
-
-    Prompt is explicit to improve consistency and reduce extra text.
-    """
-    system_prompt = (
-        "You extract structured receipt data. "
-        "Return ONLY one JSON object with exactly these keys: "
-        "store (string), date (YYYY-MM-DD string), total (integer), tax8 (integer), "
-        "tax10 (integer), payment (string), category (string). "
-        "Do not include markdown. Do not include explanations."
-    )
-
-    user_prompt = (
-        "Extract data from the OCR text below.\n"
-        "Rules:\n"
-        "- date must be formatted as YYYY-MM-DD.\n"
-        "- total, tax8, tax10 must be integers in yen without commas/symbols.\n"
-        "- if tax8 or tax10 is not found, set it to 0.\n"
-        "- payment examples: cash, credit_card, ic_card, quickpay, mobile_pay.\n"
-        "- category should be a concise spending category (e.g., food, transport, office, shopping).\n\n"
-        f"OCR text:\n{ocr_text}"
-    )
-
-    response = client.chat.completions.create(
-        model=model,
-        temperature=0,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    )
-
-    content = response.choices[0].message.content or ""
-    parsed = extract_json_from_text(content)
-    return validate_record(parsed)
-
-
-def append_to_excel(excel_path: Path, records: List[Dict[str, Any]], sheet_name: str | None = None) -> Tuple[str, int]:
-    """
-    Append records into existing Excel file.
-
-    If first row contains headers matching all required keys, append values by header order.
-    Otherwise append values in fixed schema order.
-    Returns tuple: (used_sheet_name, appended_count)
-    """
-    wb = load_workbook(excel_path)
-    ws = wb[sheet_name] if sheet_name else wb.active
-
-    required_keys = list(REQUIRED_SCHEMA.keys())
-
-    # Try to detect header row and map by names
-    header_row = [ws.cell(row=1, column=i).value for i in range(1, ws.max_column + 1)]
-    header_map = {str(v).strip(): idx + 1 for idx, v in enumerate(header_row) if v is not None}
-    has_all_headers = all(key in header_map for key in required_keys)
-
-    appended = 0
-    for rec in records:
-        if has_all_headers:
-            next_row = ws.max_row + 1
-            for key in required_keys:
-                ws.cell(row=next_row, column=header_map[key], value=rec[key])
-        else:
-            ws.append([rec[key] for key in required_keys])
-        appended += 1
-
-    wb.save(excel_path)
-    return ws.title, appended
-
-
-def collect_image_files(input_folder: Path) -> List[Path]:
-    """Collect supported image files from input folder (non-recursive)."""
-    return sorted(
-        p for p in input_folder.iterdir() if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
-    )
-
-
-def process_folder(
-    input_folder: Path,
-    excel_template: Path,
-    model: str,
-    ocr_lang: str,
-    tesseract_cmd: str | None,
-    sheet_name: str | None,
-) -> None:
-    """End-to-end pipeline for OCR -> OpenAI extraction -> Excel append."""
-    if not input_folder.exists() or not input_folder.is_dir():
-        raise FileNotFoundError(f"Input folder not found: {input_folder}")
-
-    if not excel_template.exists():
-        raise FileNotFoundError(f"Excel template not found: {excel_template}")
-
-    if tesseract_cmd:
-        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
-
-    image_files = collect_image_files(input_folder)
-    if not image_files:
-        print(f"No image files found in: {input_folder}")
-        return
-
-    client = OpenAI()
-
-    results: List[ProcessResult] = []
-    valid_records: List[Dict[str, Any]] = []
-
-    for image_path in image_files:
+    def _worker_process(self) -> None:
         try:
-            text = ocr_image(image_path, lang=ocr_lang)
-            record = call_openai_extract(client=client, model=model, ocr_text=text)
-            results.append(ProcessResult(file_name=image_path.name, ok=True, data=record))
-            valid_records.append(record)
-            print(f"[OK] {image_path.name}: {record}")
+            processor = ReceiptProcessor(
+                model=self.model_var.get().strip() or "gpt-4.1-mini",
+                ocr_lang=self.ocr_lang_var.get().strip() or "jpn+eng",
+            )
+            records, failures = processor.process_folder(Path(self.input_folder_var.get().strip()))
+            self.result_queue.put(("ok", records, failures))
         except Exception as exc:
-            results.append(ProcessResult(file_name=image_path.name, ok=False, error=str(exc)))
-            print(f"[NG] {image_path.name}: {exc}")
+            self.result_queue.put(("error", str(exc)))
 
-    if valid_records:
-        used_sheet, n = append_to_excel(excel_template, valid_records, sheet_name=sheet_name)
-        print(f"\nAppended {n} rows to '{excel_template}' (sheet: '{used_sheet}').")
-    else:
-        print("\nNo valid records to append.")
+    def _poll_worker(self) -> None:
+        try:
+            result = self.result_queue.get_nowait()
+            if result[0] == "ok":
+                _, records, failures = result
+                self.records = records
+                self._render_table()
+                self._set_processing_state(False)
+                self.status_var.set(f"処理完了: 成功 {len(records)}件 / 失敗 {len(failures)}件")
+                if failures:
+                    detail = "\n".join(f"{f.file_name}: {f.reason}" for f in failures)
+                    messagebox.showwarning("一部失敗", f"以下のファイルで処理に失敗しました:\n\n{detail}")
+                if not records:
+                    messagebox.showerror("処理結果", "有効なレコードを作成できませんでした。")
+            else:
+                _, error = result
+                self._set_processing_state(False)
+                self.status_var.set("エラー")
+                messagebox.showerror("処理エラー", str(error))
+        except Empty:
+            pass
+        finally:
+            self.root.after(200, self._poll_worker)
 
-    # pandas usage: create a compact summary report
-    df = pd.DataFrame([r.data for r in results if r.ok and r.data])
-    ok_count = sum(r.ok for r in results)
-    ng_count = len(results) - ok_count
+    def _render_table(self) -> None:
+        self.tree.delete(*self.tree.get_children())
+        for index, (file_name, rec) in enumerate(self.records):
+            self.tree.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=(file_name, rec.date, rec.store, rec.total, rec.category, rec.payment, rec.note),
+            )
 
-    print("\n=== Summary ===")
-    print(f"Total images: {len(results)}")
-    print(f"Succeeded  : {ok_count}")
-    print(f"Failed     : {ng_count}")
+    def _on_row_selected(self, _event: object) -> None:
+        selected = self.tree.selection()
+        if not selected:
+            self.selected_item_id = None
+            return
 
-    if not df.empty:
-        print("\nBy category:")
-        print(df.groupby("category")["total"].agg(["count", "sum"]).reset_index())
+        item_id = selected[0]
+        self.selected_item_id = item_id
+        row_idx = int(item_id)
+        self.category_var.set(self.records[row_idx][1].category)
 
-    if ng_count > 0:
-        print("\nFailed files:")
-        for r in results:
-            if not r.ok:
-                print(f"- {r.file_name}: {r.error}")
+    def _update_selected_category(self, _event: object) -> None:
+        if self.selected_item_id is None:
+            return
 
+        row_idx = int(self.selected_item_id)
+        file_name, record = self.records[row_idx]
+        record.category = self.category_var.get()
+        self.records[row_idx] = (file_name, record)
 
-def parse_args() -> argparse.Namespace:
-    """Parse command-line options."""
-    parser = argparse.ArgumentParser(description="OCR receipts and append structured data to an Excel template.")
-    parser.add_argument("--input-folder", required=True, help="Folder containing receipt images")
-    parser.add_argument("--excel-template", default="expense.xlsx", help="Path to existing Excel file")
-    parser.add_argument("--model", default="gpt-4.1-mini", help="OpenAI model name")
-    parser.add_argument("--ocr-lang", default="jpn+eng", help="Tesseract language(s), e.g. 'jpn+eng'")
-    parser.add_argument("--tesseract-cmd", default=None, help="Optional full path to tesseract executable")
-    parser.add_argument("--sheet-name", default=None, help="Optional sheet name in Excel workbook")
-    return parser.parse_args()
+        current_values = list(self.tree.item(self.selected_item_id, "values"))
+        current_values[4] = record.category
+        self.tree.item(self.selected_item_id, values=current_values)
+
+    def _save_to_excel(self) -> None:
+        excel_path = self.excel_path_var.get().strip()
+        if not excel_path:
+            messagebox.showerror("入力不足", "保存先Excelを指定してください。")
+            return
+
+        if not self.records:
+            messagebox.showerror("保存不可", "保存対象データがありません。")
+            return
+
+        try:
+            sheet_name = self.sheet_name_var.get().strip() or None
+            appended = append_records_to_excel(
+                excel_path=Path(excel_path),
+                records=[r for _, r in self.records],
+                sheet_name=sheet_name,
+            )
+            messagebox.showinfo("保存完了", f"{appended}件のレコードをExcelに追記しました。")
+            self.status_var.set(f"Excel保存完了: {appended}件追記")
+        except Exception as exc:
+            messagebox.showerror("保存エラー", str(exc))
 
 
 def main() -> None:
-    args = parse_args()
-    process_folder(
-        input_folder=Path(args.input_folder),
-        excel_template=Path(args.excel_template),
-        model=args.model,
-        ocr_lang=args.ocr_lang,
-        tesseract_cmd=args.tesseract_cmd,
-        sheet_name=args.sheet_name,
-    )
+    root = tk.Tk()
+    ReceiptApp(root)
+    root.mainloop()
 
 
 if __name__ == "__main__":
