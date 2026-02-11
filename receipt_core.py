@@ -135,6 +135,14 @@ def normalize_date_value(value: Any) -> Tuple[str, str]:
 
     normalized_input = text.replace(".", "/").replace("-", "/")
 
+    def _to_full_year(year_text: str) -> int:
+        year_num = int(year_text)
+        if len(year_text) == 2:
+            # 2桁年(例: 25年)は現代のレシート利用を想定し、
+            # 00-69 => 2000-2069 / 70-99 => 1970-1999 で補完する。
+            return 2000 + year_num if year_num <= 69 else 1900 + year_num
+        return year_num
+
     seireki_match = re.search(r"^(\d{4})\s*/\s*(\d{1,2})\s*/\s*(\d{1,2})$", normalized_input)
     if seireki_match:
         y, m, d = map(int, seireki_match.groups())
@@ -156,12 +164,31 @@ def normalize_date_value(value: Any) -> Tuple[str, str]:
         except ValueError:
             return text, "date_parse_failed"
 
+    jp_seireki_match = re.search(r"^(\d{2}|\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日?$", text)
+    if jp_seireki_match:
+        year_text, month, day = jp_seireki_match.groups()
+        try:
+            year = _to_full_year(year_text)
+            return date(year, int(month), int(day)).strftime("%Y/%m/%d"), ""
+        except ValueError:
+            return text, "date_parse_failed"
+
     compact_match = re.search(r"^(\d{8})$", re.sub(r"\D", "", text))
     if compact_match:
         digits = compact_match.group(1)
         y, m, d = int(digits[:4]), int(digits[4:6]), int(digits[6:8])
         try:
             return date(y, m, d).strftime("%Y/%m/%d"), ""
+        except ValueError:
+            return text, "date_parse_failed"
+
+    compact_6_match = re.search(r"^(\d{6})$", re.sub(r"\D", "", text))
+    if compact_6_match:
+        digits = compact_6_match.group(1)
+        year = _to_full_year(digits[:2])
+        month, day = int(digits[2:4]), int(digits[4:6])
+        try:
+            return date(year, month, day).strftime("%Y/%m/%d"), ""
         except ValueError:
             return text, "date_parse_failed"
 
