@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 from urllib.parse import quote
@@ -14,26 +14,38 @@ from openpyxl import Workbook, load_workbook
 
 SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 
-DEFAULT_COLUMNS = [
-    "date",
-    "store",
-    "total",
-    "category",
-    "payment",
-    "note",
+EXCEL_COLUMNS = [
+    "日付",
+    "勘定科目",
+    "内容",
+    "支払先",
+    "支払方法",
+    "金額(税込)",
+    "税区分",
+    "事業利用割合(%)",
+    "経費計上額",
+    "備考",
     "is_error",
     "error_reason",
-    "source_image_link",
+    "その他項目",
 ]
 
-EDITABLE_COLUMNS = [
-    "date",
-    "store",
-    "total",
-    "category",
-    "payment",
-    "note",
-]
+
+FIELD_ALIASES = {
+    "date": "日付",
+    "category": "勘定科目",
+    "description": "内容",
+    "content": "内容",
+    "store": "支払先",
+    "vendor": "支払先",
+    "payment": "支払方法",
+    "total": "金額(税込)",
+    "tax": "税区分",
+    "business_ratio": "事業利用割合(%)",
+    "expense_amount": "経費計上額",
+    "note": "備考",
+    "other": "その他項目",
+}
 
 JAPANESE_ACCOUNTING_CATEGORIES = [
     "旅費交通費",
@@ -75,8 +87,10 @@ class ReceiptRecord:
         self.fields[key] = value
 
     def normalize_date_inplace(self) -> None:
-        normalized, reason = normalize_date_value(self.get("date", ""))
-        self.set("date", normalized)
+        # 和暦(例: 令和6年1月15日) / 西暦(例: 2025/01/15) を YYYY/MM/DD へ正規化する。
+        # 解釈不能な場合は空文字へ落とし、処理は継続する。
+        normalized, reason = normalize_date_value(self.get("日付", ""))
+        self.set("日付", normalized)
         if reason:
             self.mark_error(reason)
 
@@ -126,7 +140,7 @@ def normalize_date_value(value: Any) -> Tuple[str, str]:
         try:
             return date(y, m, d).strftime("%Y/%m/%d"), ""
         except ValueError:
-            return text, "date_parse_error"
+            return "", "date_parse_failed"
 
     wareki_match = re.search(
         r"(令和|平成|昭和|大正|明治)\s*(元|\d{1,2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日",
@@ -139,7 +153,7 @@ def normalize_date_value(value: Any) -> Tuple[str, str]:
         try:
             return date(year, int(month), int(day)).strftime("%Y/%m/%d"), ""
         except ValueError:
-            return text, "date_parse_error"
+            return "", "date_parse_failed"
 
     compact_match = re.search(r"^(\d{8})$", re.sub(r"\D", "", text))
     if compact_match:
@@ -148,9 +162,31 @@ def normalize_date_value(value: Any) -> Tuple[str, str]:
         try:
             return date(y, m, d).strftime("%Y/%m/%d"), ""
         except ValueError:
-            return text, "date_parse_error"
+            return "", "date_parse_failed"
 
-    return text, "date_parse_error"
+    return "", "date_parse_failed"
+
+
+def sanitize_optional_text(value: Any, max_len: int = 120) -> str:
+    text = str(value or "").strip()
+    if len(text) > max_len or "\n" in text:
+        return ""
+    return text
+
+
+def calculate_expense_amount(amount_text: Any, ratio_text: Any) -> str:
+    amount_digits = re.sub(r"[^0-9-]", "", str(amount_text or ""))
+    ratio_raw = str(ratio_text or "").strip().replace("％", "%").replace("%", "")
+    if not amount_digits or amount_digits == "-" or not ratio_raw:
+        return ""
+
+    try:
+        amount = float(amount_digits)
+        ratio = float(ratio_raw)
+    except ValueError:
+        return ""
+
+    return str(int(round(amount * ratio / 100.0)))
 
 
 def _extract_json_from_text(text: str) -> Dict[str, Any]:
@@ -177,33 +213,45 @@ def _normalize_record(raw: Dict[str, Any], image_path: Path) -> ReceiptRecord:
     )
 
     for key, value in raw.items():
+        normalized_key = FIELD_ALIASES.get(key, key)
         if isinstance(value, (dict, list)):
-            record.set(key, json.dumps(value, ensure_ascii=False))
+            record.set(normalized_key, json.dumps(value, ensure_ascii=False))
         else:
-            record.set(key, "" if value is None else str(value).strip())
+            record.set(normalized_key, "" if value is None else str(value).strip())
 
-    if not record.get("store"):
+    if not record.get("支払先"):
         record.mark_error("store_not_found")
 
-    total_raw = record.get("total", "")
+    total_raw = record.get("金額(税込)", "")
     digits = re.sub(r"[^0-9-]", "", str(total_raw))
     if digits in {"", "-"}:
         record.mark_error("amount_not_found")
-        record.set("total", str(total_raw))
+        record.set("金額(税込)", "")
     else:
-        record.set("total", digits)
+        record.set("金額(税込)", digits)
 
-    normalized_date, date_error = normalize_date_value(record.get("date", ""))
-    record.set("date", normalized_date)
+    normalized_date, date_error = normalize_date_value(record.get("日付", ""))
+    record.set("日付", normalized_date)
     if date_error:
         record.mark_error(date_error)
 
-    if not record.get("category"):
-        record.set("category", "雑費")
-    if not record.get("payment"):
-        record.set("payment", "不明")
-    if not record.get("note"):
-        record.set("note", f"OCR元: {image_path.name}")
+    if not record.get("勘定科目"):
+        record.set("勘定科目", "雑費")
+    if not record.get("支払方法"):
+        record.set("支払方法", "不明")
+
+    record.set("備考", sanitize_optional_text(record.get("備考", "")))
+    record.set("その他項目", sanitize_optional_text(record.get("その他項目", "")))
+
+    for column in EXCEL_COLUMNS:
+        if column in {"is_error", "error_reason"}:
+            continue
+        record.set(column, str(record.get(column, "")).strip())
+
+    record.set(
+        "経費計上額",
+        calculate_expense_amount(record.get("金額(税込)", ""), record.get("事業利用割合(%)", "")),
+    )
 
     return record
 
@@ -239,16 +287,17 @@ class ReceiptProcessor:
     def _call_openai(self, client: OpenAI, ocr_text: str) -> Dict[str, Any]:
         system_prompt = (
             "You extract structured data from Japanese receipts. "
-            "Return ONLY one JSON object. Include at least keys: date, store, total, category, payment, note."
+            "Return ONLY one JSON object. Include at least keys: 日付, 勘定科目, 内容, 支払先, 支払方法, 金額(税込), 税区分, 備考, その他項目."
         )
         user_prompt = (
             "OCR text から経費精算向けデータを抽出してください。\n"
             "Rules:\n"
-            "- date は可能なら日付文字列。和暦でも可\n"
-            "- total は金額\n"
-            "- category は日本語の会計カテゴリ\n"
-            "- payment は支払方法\n"
-            "- note は短い補足(なければ空文字)\n"
+            "- 日付 は可能なら日付文字列。和暦でも可\n"
+            "- 勘定科目 は日本語の会計カテゴリ\n"
+            "- 金額(税込) は金額\n"
+            "- 支払方法 は支払方法\n"
+            "- 備考 は短い補足(なければ空文字)\n"
+            "- OCR原文の全文を備考・その他項目へ入れない\n"
             "- わからない項目は空文字で返す\n"
             f"OCR:\n{ocr_text}"
         )
@@ -296,7 +345,19 @@ class ReceiptProcessor:
                 error_record = ReceiptRecord(
                     file_name=image_path.name,
                     source_image_path=str(image_path),
-                    fields={"date": "", "store": "", "total": "", "note": "OCR/解析失敗"},
+                    fields={
+                        "日付": "",
+                        "勘定科目": "",
+                        "内容": "",
+                        "支払先": "",
+                        "支払方法": "",
+                        "金額(税込)": "",
+                        "税区分": "",
+                        "事業利用割合(%)": "",
+                        "経費計上額": "",
+                        "備考": "",
+                        "その他項目": "",
+                    },
                     is_error=True,
                     error_reason=str(exc),
                 )
@@ -306,12 +367,8 @@ class ReceiptProcessor:
 
 
 def _build_column_order(records: Sequence[ReceiptRecord]) -> List[str]:
-    discovered = set(DEFAULT_COLUMNS)
-    for record in records:
-        discovered.update(record.fields.keys())
-
-    extras = sorted(col for col in discovered if col not in DEFAULT_COLUMNS)
-    return ["file_name", *DEFAULT_COLUMNS, *extras]
+    _ = records
+    return list(EXCEL_COLUMNS)
 
 
 def append_records_to_excel(excel_path: Path, records: Sequence[ReceiptRecord], sheet_name: str | None = None) -> int:
