@@ -1,46 +1,41 @@
 # OCRGPT
 
-Tkinter desktop application for receipt OCR + OpenAI extraction + Excel append.
+Batch receipt OCR + OpenAI extraction script.
 
-## Features
-- Select a folder of receipt images (`png/jpg/jpeg/bmp/tif/tiff/webp`)
-- Run OCR with `pytesseract`
-- Extract structured JSON with OpenAI:
-  - `store` (string)
-  - `date` (`YYYY-MM-DD`)
-  - `total` (integer)
-  - `tax8` (integer)
-  - `tax10` (integer)
-  - `payment` (string)
-  - `category` (string)
-- Validate fields and append to an existing Excel file
-- Progress indicator + scrollable logs
+## Script
+- `receipt_to_excel.py`
+
+## What it does
+1. Reads receipt images from an input folder.
+2. Runs OCR with `pytesseract`.
+3. Sends OCR text to OpenAI and requests strict JSON fields:
+   - `store` (string)
+   - `date` (`YYYY-MM-DD`)
+   - `total` (integer)
+   - `tax8` (integer)
+   - `tax10` (integer)
+   - `payment` (string)
+   - `category` (string)
+4. Validates keys and types.
+5. Appends rows to an existing `expense.xlsx` template.
+6. Prints a processing summary.
 
 ## Requirements
 ```bash
-pip install pytesseract openai openpyxl pandas
+pip install pytesseract openai pandas openpyxl
 ```
+Also install Tesseract OCR engine on your OS.
 
-### External dependency (required)
-Install **Tesseract OCR engine** on your OS and ensure `tesseract` is available in PATH.
-If it is not in PATH, set the path in the GUI field: `Tesseract Path (optional)`.
-
-## Run the GUI
+## Usage
 ```bash
 export OPENAI_API_KEY="your_api_key"
-python receipt_to_excel.py
+python receipt_to_excel.py \
+  --input-folder ./receipts \
+  --excel-template ./expense.xlsx
 ```
 
-## Build standalone executable (PyInstaller)
-```bash
-pip install pyinstaller
-pyinstaller --onefile --windowed --name ReceiptOCRApp receipt_to_excel.py
-```
-
-Generated executable is typically in:
-- `dist/ReceiptOCRApp` (macOS/Linux)
-- `dist/ReceiptOCRApp.exe` (Windows)
-
-## Notes for distribution
-- End users still need Tesseract OCR installed on their machine.
-- Provide an existing Excel template file (e.g., `expense.xlsx`) before running.
+Optional flags:
+- `--model gpt-4.1-mini`
+- `--ocr-lang jpn+eng`
+- `--tesseract-cmd /usr/bin/tesseract`
+- `--sheet-name Sheet1`
