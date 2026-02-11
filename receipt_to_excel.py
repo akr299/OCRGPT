@@ -181,7 +181,7 @@ class ReceiptApp:
             return True
 
     def _load_saved_api_key_or_prompt(self) -> None:
-        self.api_key = self.api_key_manager.load_key()
+        self.api_key = self.api_key_manager.load_api_key()
         self._update_api_key_status()
         if not self.api_key:
             self._prompt_api_key(required=True)
