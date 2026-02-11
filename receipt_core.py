@@ -11,6 +11,7 @@ from urllib.parse import quote
 import pytesseract
 from openai import AuthenticationError, OpenAI, RateLimitError
 from openpyxl import Workbook, load_workbook
+from openpyxl.styles import PatternFill
 
 SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 
@@ -27,9 +28,7 @@ EXCEL_COLUMNS = [
     "備考",
     "is_error",
     "error_reason",
-    "その他項目",
 ]
-
 
 FIELD_ALIASES = {
     "date": "日付",
@@ -44,7 +43,6 @@ FIELD_ALIASES = {
     "business_ratio": "事業利用割合(%)",
     "expense_amount": "経費計上額",
     "note": "備考",
-    "other": "その他項目",
 }
 
 JAPANESE_ACCOUNTING_CATEGORIES = [
@@ -71,6 +69,8 @@ ERA_YEAR_OFFSET = {
     "明治": 1867,
 }
 
+ERROR_ROW_FILL = PatternFill(fill_type="solid", start_color="FFF4B4B4", end_color="FFF4B4B4")
+
 
 @dataclass
 class ReceiptRecord:
@@ -86,20 +86,16 @@ class ReceiptRecord:
     def set(self, key: str, value: Any) -> None:
         self.fields[key] = value
 
-    def normalize_date_inplace(self) -> None:
-        # 和暦(例: 令和6年1月15日) / 西暦(例: 2025/01/15) を YYYY/MM/DD へ正規化する。
-        # 解釈不能な場合は空文字へ落とし、処理は継続する。
-        normalized, reason = normalize_date_value(self.get("日付", ""))
-        self.set("日付", normalized)
-        if reason:
-            self.mark_error(reason)
-
     def mark_error(self, reason: str) -> None:
         self.is_error = True
         existing = [item for item in self.error_reason.split("|") if item]
         if reason and reason not in existing:
             existing.append(reason)
         self.error_reason = "|".join(existing)
+
+    def clear_error(self) -> None:
+        self.is_error = False
+        self.error_reason = ""
 
     def source_image_link(self) -> str:
         resolved = Path(self.source_image_path).resolve().as_posix()
@@ -128,19 +124,32 @@ class ProcessFailure:
 
 
 def normalize_date_value(value: Any) -> Tuple[str, str]:
+    """
+    日付文字列を YYYY/MM/DD に正規化する。
+    - 西暦/和暦の変換に成功した場合のみ正規化値を返す
+    - 変換不能な場合は元文字列を保持しつつ date_parse_failed を返す
+    """
     text = str(value or "").strip()
     if not text:
         return "", ""
 
-    text = text.replace(".", "/").replace("-", "/")
+    normalized_input = text.replace(".", "/").replace("-", "/")
 
-    seireki_match = re.search(r"^(\d{4})\s*/\s*(\d{1,2})\s*/\s*(\d{1,2})$", text)
+    def _to_full_year(year_text: str) -> int:
+        year_num = int(year_text)
+        if len(year_text) == 2:
+            # 2桁年(例: 25年)は現代のレシート利用を想定し、
+            # 00-69 => 2000-2069 / 70-99 => 1970-1999 で補完する。
+            return 2000 + year_num if year_num <= 69 else 1900 + year_num
+        return year_num
+
+    seireki_match = re.search(r"^(\d{4})\s*/\s*(\d{1,2})\s*/\s*(\d{1,2})$", normalized_input)
     if seireki_match:
         y, m, d = map(int, seireki_match.groups())
         try:
             return date(y, m, d).strftime("%Y/%m/%d"), ""
         except ValueError:
-            return "", "date_parse_failed"
+            return text, "date_parse_failed"
 
     wareki_match = re.search(
         r"(令和|平成|昭和|大正|明治)\s*(元|\d{1,2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日",
@@ -153,7 +162,16 @@ def normalize_date_value(value: Any) -> Tuple[str, str]:
         try:
             return date(year, int(month), int(day)).strftime("%Y/%m/%d"), ""
         except ValueError:
-            return "", "date_parse_failed"
+            return text, "date_parse_failed"
+
+    jp_seireki_match = re.search(r"^(\d{2}|\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日?$", text)
+    if jp_seireki_match:
+        year_text, month, day = jp_seireki_match.groups()
+        try:
+            year = _to_full_year(year_text)
+            return date(year, int(month), int(day)).strftime("%Y/%m/%d"), ""
+        except ValueError:
+            return text, "date_parse_failed"
 
     compact_match = re.search(r"^(\d{8})$", re.sub(r"\D", "", text))
     if compact_match:
@@ -162,16 +180,19 @@ def normalize_date_value(value: Any) -> Tuple[str, str]:
         try:
             return date(y, m, d).strftime("%Y/%m/%d"), ""
         except ValueError:
-            return "", "date_parse_failed"
+            return text, "date_parse_failed"
 
-    return "", "date_parse_failed"
+    compact_6_match = re.search(r"^(\d{6})$", re.sub(r"\D", "", text))
+    if compact_6_match:
+        digits = compact_6_match.group(1)
+        year = _to_full_year(digits[:2])
+        month, day = int(digits[2:4]), int(digits[4:6])
+        try:
+            return date(year, month, day).strftime("%Y/%m/%d"), ""
+        except ValueError:
+            return text, "date_parse_failed"
 
-
-def sanitize_optional_text(value: Any, max_len: int = 120) -> str:
-    text = str(value or "").strip()
-    if len(text) > max_len or "\n" in text:
-        return ""
-    return text
+    return text, "date_parse_failed"
 
 
 def calculate_expense_amount(amount_text: Any, ratio_text: Any) -> str:
@@ -187,6 +208,26 @@ def calculate_expense_amount(amount_text: Any, ratio_text: Any) -> str:
         return ""
 
     return str(int(round(amount * ratio / 100.0)))
+
+
+def infer_tax_category(value: Any) -> Tuple[str, str]:
+    """
+    税区分は OCR/AI 文字列から税率が判別できる場合のみ返す。
+    8% / 10% を優先し、不明時は空文字 + tax_rate_unknown を返す。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return "", "tax_rate_unknown"
+
+    normalized = text.replace("％", "%").replace("１０", "10").replace("８", "8")
+    if re.search(r"\b10\s*%", normalized) or "10%" in normalized:
+        return "10%", ""
+    if re.search(r"\b8\s*%", normalized) or "8%" in normalized:
+        return "8%", ""
+    if "軽減" in normalized:
+        return "8%", ""
+
+    return "", "tax_rate_unknown"
 
 
 def _extract_json_from_text(text: str) -> Dict[str, Any]:
@@ -235,23 +276,25 @@ def _normalize_record(raw: Dict[str, Any], image_path: Path) -> ReceiptRecord:
     if date_error:
         record.mark_error(date_error)
 
+    tax_value, tax_error = infer_tax_category(record.get("税区分", ""))
+    record.set("税区分", tax_value)
+    if tax_error:
+        record.mark_error(tax_error)
+
     if not record.get("勘定科目"):
         record.set("勘定科目", "雑費")
     if not record.get("支払方法"):
         record.set("支払方法", "不明")
 
-    record.set("備考", sanitize_optional_text(record.get("備考", "")))
-    record.set("その他項目", sanitize_optional_text(record.get("その他項目", "")))
+    # 仕様: 以下3項目は OCR/AI 抽出では必ず空白初期化し、GUI手動入力を前提とする。
+    record.set("事業利用割合(%)", "")
+    record.set("経費計上額", "")
+    record.set("備考", "")
 
     for column in EXCEL_COLUMNS:
         if column in {"is_error", "error_reason"}:
             continue
         record.set(column, str(record.get(column, "")).strip())
-
-    record.set(
-        "経費計上額",
-        calculate_expense_amount(record.get("金額(税込)", ""), record.get("事業利用割合(%)", "")),
-    )
 
     return record
 
@@ -287,7 +330,7 @@ class ReceiptProcessor:
     def _call_openai(self, client: OpenAI, ocr_text: str) -> Dict[str, Any]:
         system_prompt = (
             "You extract structured data from Japanese receipts. "
-            "Return ONLY one JSON object. Include at least keys: 日付, 勘定科目, 内容, 支払先, 支払方法, 金額(税込), 税区分, 備考, その他項目."
+            "Return ONLY one JSON object. Include keys: 日付, 勘定科目, 内容, 支払先, 支払方法, 金額(税込), 税区分."
         )
         user_prompt = (
             "OCR text から経費精算向けデータを抽出してください。\n"
@@ -296,8 +339,8 @@ class ReceiptProcessor:
             "- 勘定科目 は日本語の会計カテゴリ\n"
             "- 金額(税込) は金額\n"
             "- 支払方法 は支払方法\n"
-            "- 備考 は短い補足(なければ空文字)\n"
-            "- OCR原文の全文を備考・その他項目へ入れない\n"
+            "- 税区分 は税率が分かる場合のみ記載(8%/10%)\n"
+            "- OCR原文の全文をフィールドへ出力しない\n"
             "- わからない項目は空文字で返す\n"
             f"OCR:\n{ocr_text}"
         )
@@ -345,19 +388,7 @@ class ReceiptProcessor:
                 error_record = ReceiptRecord(
                     file_name=image_path.name,
                     source_image_path=str(image_path),
-                    fields={
-                        "日付": "",
-                        "勘定科目": "",
-                        "内容": "",
-                        "支払先": "",
-                        "支払方法": "",
-                        "金額(税込)": "",
-                        "税区分": "",
-                        "事業利用割合(%)": "",
-                        "経費計上額": "",
-                        "備考": "",
-                        "その他項目": "",
-                    },
+                    fields={col: "" for col in EXCEL_COLUMNS if col not in {"is_error", "error_reason"}},
                     is_error=True,
                     error_reason=str(exc),
                 )
@@ -388,8 +419,11 @@ def append_records_to_excel(excel_path: Path, records: Sequence[ReceiptRecord], 
     ws.delete_rows(1, ws.max_row)
     ws.append(columns)
 
-    for record in records:
+    for row_index, record in enumerate(records, start=2):
         ws.append(record.excel_row(columns))
+        if record.is_error:
+            for cell in ws[row_index]:
+                cell.fill = ERROR_ROW_FILL
 
     ws.auto_filter.ref = ws.dimensions
     ws.freeze_panes = "A2"
