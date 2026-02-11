@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import platform
 from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -9,10 +11,31 @@ class ApiKeyManager:
     """OpenAI APIキーを暗号化してローカル保存するヘルパー。"""
 
     def __init__(self, config_dir: Path | None = None):
-        base_dir = Path(__file__).resolve().parent
-        self.config_dir = config_dir or (base_dir / "config")
+        self.config_dir = config_dir or self._default_config_dir()
         self.key_file = self.config_dir / "key.bin"
         self.encrypted_api_key_file = self.config_dir / "api_key.enc"
+
+    @staticmethod
+    def _default_config_dir() -> Path:
+        """実行OSに応じた設定ディレクトリを返す。"""
+        system_name = platform.system()
+
+        if system_name == "Windows":
+            local_app_data = os.environ.get("LOCALAPPDATA")
+            if local_app_data:
+                return Path(local_app_data) / "OCRGPT"
+
+            # 既存挙動のフォールバック（環境変数が無い場合のみ）
+            base_dir = Path(__file__).resolve().parent
+            return base_dir / "config"
+
+        home_dir = Path.home()
+
+        if system_name == "Darwin":
+            return home_dir / "Library" / "Application Support" / "OCRGPT"
+
+        # Linux を含むその他OSは ~/.config/ocrgpt を利用
+        return home_dir / ".config" / "ocrgpt"
 
     def generate_or_load_encryption_key(self) -> bytes:
         """暗号鍵を読み込む。なければ新規作成して保存する。"""
