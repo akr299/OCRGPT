@@ -23,39 +23,52 @@
 - Tesseract OCR（OS側にインストール）
 - OpenAI APIキー
 
-依存ライブラリ:
+開発依存ライブラリ:
 ```bash
 pip install pytesseract openai openpyxl cryptography
 ```
 
+## 環境構築
+1. OpenAI APIキー
+   - OpenAI APIキー取得手順　**メモしておくこと！**
+      - https://note.com/ai_dev_lab/n/nbf092fa1d1ec
+2. Tesseract 
+   - Googleが開発しているOCRエンジン
+   - インストール手順
+      - https://gammasoft.jp/blog/tesseract-ocr-install-on-windows/
+
 ## 使い方（GUI）
-```bash
-python receipt_to_excel.py
-```
+- exeをダブルクリックして実行
+- 開発
+   ```bash
+   python receipt_to_excel.py
+   ```
 
 画面操作:
-1. **画像フォルダ**を選択
-2. **保存先Excel**を選択（新規作成可）
-3. `OCR + OpenAI実行` を押下
-4. 抽出テーブルを確認
+1. APIキーを設定(初回のみ)
+2. **画像フォルダ**を選択
+3. **保存先Excel**を選択（新規作成可）
+4. `OCR + OpenAI実行` を押下
+5. 抽出テーブルを確認
    - ダブルクリックで各セル編集
    - 下部フォームから「日付/店名/金額/その他」をまとめて修正
    - 日付は和暦・西暦どちらも入力可能
-5. 必要に応じて `元画像を開く` で画像確認
-6. `Save to Excel` を押下
+6. 必要に応じて `元画像を開く` で画像確認
+7. `Save to Excel` を押下
 
 ## Excel出力列（例）
-- `file_name`
-- `date`
-- `store`
-- `total`
-- `category`
-- `payment`
-- `note`
-- `is_error`
-- `error_reason`
-- `source_image_link`
-- その他OCRで取得できた追加項目
+1. 日付
+2. 勘定科目
+3. 内容
+4. 支払先
+5. 支払方法
+6. 金額(税込)
+7. 税区分
+8. 事業利用割合(%)
+9. 経費計上額
+10. 備考
+11. is_error
+12. error_reason
 
 出力シートには自動フィルタが設定されます。
 
@@ -63,6 +76,11 @@ python receipt_to_excel.py
 ```bash
 pip install pyinstaller
 pyinstaller --onefile --windowed --name ocrgpt_gui receipt_to_excel.py
+```
+Windowsはこっち
+```bash
+python -m pip install pyinstaller
+python -m PyInstaller --onefile --windowed --name "ocrgpt_gui_$(Get-Date -Format 'yyyyMMdd-HHmm')" receipt_to_excel.py
 ```
 
 ## ファイル構成
